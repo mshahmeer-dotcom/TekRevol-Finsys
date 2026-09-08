@@ -1,32 +1,57 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  useCreatePlaidLinkToken,
   useCreateManualPlaidItem,
+  useCreatePlaidLinkToken,
   useDeletePlaidItem,
   useExchangePlaidPublicToken,
   usePlaidAccounts,
   usePlaidItems,
-  usePlaidStatus,
   usePlaidStatements,
+  usePlaidStatus,
   usePlaidUnpostedTransactions,
   useSyncPlaidItem,
+  useUpdatePlaidTransactionReview,
   useUploadPlaidStatement,
 } from '@workspace/api-client-react';
+import { usePlaidLink } from 'react-plaid-link';
+import { useQueryClient } from '@tanstack/react-query';
+import {
+  ArrowDownLeft,
+  ArrowUpRight,
+  CalendarRange,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  CircleAlert,
+  ClipboardCheck,
+  Download,
+  FileText,
+  Filter,
+  Landmark,
+  Link2,
+  ListFilter,
+  MoreHorizontal,
+  Plus,
+  Printer,
+  RefreshCw,
+  Search,
+  Settings2,
+  SlidersHorizontal,
+  Trash2,
+  Upload,
+  WalletCards,
+  X,
+} from 'lucide-react';
 import { PageContent, PageHeader } from '@/components/layout';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { FormatCurrency } from '@/components/formatters';
 import { Skeleton } from '@/components/ui/skeleton';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
-import { usePlaidLink } from 'react-plaid-link';
-import { Download, FileText, Landmark, Link2, Plus, RefreshCw, Trash2, Upload } from 'lucide-react';
-import { useQueryClient } from '@tanstack/react-query';
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 
 const MANUAL_BANK_COUNTRIES = [
   { value: 'AE', label: 'United Arab Emirates', currency: 'AED' },
@@ -38,53 +63,106 @@ const MANUAL_BANK_COUNTRIES = [
   { value: 'PK', label: 'Pakistan', currency: 'PKR' },
 ];
 
-const BANK_ICON_OPTIONS = ['🏦', '🏛️', '💳', '🏧', '◆'];
+const BANK_ICON_OPTIONS = ['◆', '◈', '▣', '▤', '◌'];
+type ReviewTab = 'pending' | 'posted' | 'excluded';
+type DateRange = 'all' | '30' | '90';
+type RowDisposition = 'posted' | 'excluded';
+type ReviewStatus = 'pending' | RowDisposition;
+type RowReview = 'matched' | 'categorized';
 
-function BankMark({ item, compact = false, large = false }: { item: any; compact?: boolean; large?: boolean }) {
-  const fallback = String(item.institutionName || 'B').trim().slice(0, 2).toUpperCase();
+function BankMark({ item, large = false }: { item: any; large?: boolean }) {
+  const fallback = String(item?.institutionName || 'B').trim().slice(0, 2).toUpperCase();
   return (
-    <div className={`flex shrink-0 items-center justify-center rounded-md border bg-muted font-semibold ${large ? 'size-12 text-xl' : compact ? 'size-7 text-xs' : 'size-9 text-sm'}`}>
-      {item.icon || fallback}
+    <div className={`flex shrink-0 items-center justify-center rounded-md border border-[#c5d4d0] bg-[#e7efeb] font-mono font-semibold text-[#1f5d63] ${large ? 'size-11 text-lg' : 'size-8 text-[11px]'}`}>
+      {item?.icon || fallback}
     </div>
   );
 }
 
+function CountBadge({ children, active = false }: { children: React.ReactNode; active?: boolean }) {
+  return <span className={`rounded-sm px-1.5 py-0.5 font-mono text-[10px] tabular-nums ${active ? 'bg-[#d7e8e4] text-[#174e53]' : 'bg-[#e8ece9] text-[#61706e]'}`}>{children}</span>;
+}
+
+function formatDate(value?: string) {
+  if (!value) return '—';
+  const date = new Date(`${value}T00:00:00`);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString('en-US', { month: 'short', day: '2-digit', year: 'numeric' });
+}
+
+function dateIsWithin(value: string | undefined, range: DateRange) {
+  if (!value || range === 'all') return true;
+  const date = new Date(`${value}T00:00:00`).getTime();
+  return Date.now() - date <= Number(range) * 24 * 60 * 60 * 1000;
+}
+
+function transactionKey(transaction: any) {
+  return String(transaction.plaidTransactionId || `${transaction.date}-${transaction.name}-${transaction.amount}`);
+}
+
+function transactionDisposition(transaction: any): ReviewStatus {
+  return transaction.reviewStatus === 'posted' || transaction.reviewStatus === 'excluded'
+    ? transaction.reviewStatus
+    : 'pending';
+}
+
 export default function BankSpending() {
   const queryClient = useQueryClient();
-  const { data: plaidStatus } = usePlaidStatus();
-  const { data: plaidItems } = usePlaidItems();
+  const { data: plaidStatus, isLoading: isLoadingStatus } = usePlaidStatus();
+  const { data: plaidItems, isLoading: isLoadingBanks, isError: isBanksError } = usePlaidItems();
   const { data: plaidAccounts } = usePlaidAccounts();
   const [selectedBankId, setSelectedBankId] = useState<number>();
-  const banks = (plaidItems as any[]) || [];
+  const banks = useMemo(() => (plaidItems as any[]) || [], [plaidItems]);
   const selectedBank = banks.find((item) => item.id === selectedBankId);
-  const { data: unpostedTransactions, isLoading: isLoadingUnposted } = usePlaidUnpostedTransactions(selectedBankId);
+  const { data: unpostedTransactions, isLoading: isLoadingUnposted, isError: isTransactionsError, refetch: refetchTransactions } = usePlaidUnpostedTransactions(selectedBankId);
   const { data: statements, isLoading: isLoadingStatements } = usePlaidStatements(selectedBankId);
   const createLinkToken = useCreatePlaidLinkToken();
   const createManualBank = useCreateManualPlaidItem();
   const exchangeToken = useExchangePlaidPublicToken();
   const syncItem = useSyncPlaidItem();
+  const updateTransactionReview = useUpdatePlaidTransactionReview();
   const deleteItem = useDeletePlaidItem();
   const uploadStatement = useUploadPlaidStatement();
   const [linkToken, setLinkToken] = useState<string>();
   const [manualBankOpen, setManualBankOpen] = useState(false);
   const [statementUploadOpen, setStatementUploadOpen] = useState(false);
   const [statementFile, setStatementFile] = useState<File>();
-  const [manualBank, setManualBank] = useState({
-    institutionName: '',
-    country: 'PK',
-    icon: '🏦',
-  });
+  const [manualBank, setManualBank] = useState({ institutionName: '', country: 'PK', icon: '◆' });
+  const [tab, setTab] = useState<ReviewTab>('pending');
+  const [query, setQuery] = useState('');
+  const [dateRange, setDateRange] = useState<DateRange>('all');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [classFilter, setClassFilter] = useState('all');
+  const [selectedRows, setSelectedRows] = useState<Set<string>>(new Set());
+  const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
+  const [reviews, setReviews] = useState<Record<string, RowReview>>({});
+  const [visibleColumns, setVisibleColumns] = useState({ class: true, location: true, account: true });
+  const [notice, setNotice] = useState('');
+
+  const transactionFeed = useMemo(() => (unpostedTransactions as any) || {}, [unpostedTransactions]);
+  const allTransactions = useMemo(() => transactionFeed.transactions || [], [transactionFeed]);
+  const accounts = useMemo(() => (plaidAccounts as any[]) || [], [plaidAccounts]);
+
+  useEffect(() => {
+    if (banks.length && !banks.some((item) => item.id === selectedBankId)) setSelectedBankId(banks[0].id);
+    if (!banks.length) setSelectedBankId(undefined);
+  }, [banks, selectedBankId]);
+
+  useEffect(() => {
+    setSelectedRows(new Set());
+    setExpandedRows(new Set());
+  }, [tab, selectedBankId]);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(''), 3600);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
 
   const onPlaidSuccess = useCallback((publicToken: string, metadata: any) => {
     exchangeToken.mutate(
       {
         publicToken,
-        institution: metadata?.institution
-          ? {
-              institution_id: metadata.institution.institution_id,
-              name: metadata.institution.name,
-            }
-          : undefined,
+        institution: metadata?.institution ? { institution_id: metadata.institution.institution_id, name: metadata.institution.name } : undefined,
       },
       {
         onSuccess: (result: any) => {
@@ -97,42 +175,29 @@ export default function BankSpending() {
     );
   }, [exchangeToken, queryClient]);
 
-  const { open, ready } = usePlaidLink({
-    token: linkToken || '',
-    onSuccess: onPlaidSuccess,
-    onExit: () => setLinkToken(undefined),
-  });
+  const { open, ready } = usePlaidLink({ token: linkToken || '', onSuccess: onPlaidSuccess, onExit: () => setLinkToken(undefined) });
 
   useEffect(() => {
     if (linkToken && ready) open();
   }, [linkToken, ready, open]);
 
-  useEffect(() => {
-    if (banks.length === 0) {
-      if (selectedBankId !== undefined) setSelectedBankId(undefined);
-    } else if (!banks.some((item) => item.id === selectedBankId)) {
-      setSelectedBankId(banks[0].id);
-    }
-  }, [banks, selectedBankId]);
-
-  const connectBank = () => {
-    createLinkToken.mutate(undefined, {
-      onSuccess: (result: any) => setLinkToken(result.linkToken),
-    });
-  };
-
-  const refreshPlaidData = () => {
+  const refreshPlaidData = useCallback(() => {
     queryClient.invalidateQueries({ queryKey: ['plaid-items'] });
     queryClient.invalidateQueries({ queryKey: ['plaid-accounts'] });
     queryClient.invalidateQueries({ queryKey: ['plaid-unposted-transactions', selectedBankId] });
     queryClient.invalidateQueries({ queryKey: ['plaid-statements', selectedBankId] });
+  }, [queryClient, selectedBankId]);
+
+  const connectBank = () => {
+    createLinkToken.mutate(undefined, { onSuccess: (result: any) => setLinkToken(result.linkToken) });
   };
 
   const addManualBank = () => {
+    if (!manualBank.institutionName.trim()) return;
     createManualBank.mutate(manualBank, {
       onSuccess: (result: any) => {
         setManualBankOpen(false);
-        setManualBank({ institutionName: '', country: 'PK', icon: '🏦' });
+        setManualBank({ institutionName: '', country: 'PK', icon: '◆' });
         if (result?.itemId) setSelectedBankId(result.itemId);
         refreshPlaidData();
       },
@@ -140,6 +205,7 @@ export default function BankSpending() {
   };
 
   const disconnectBank = (item: any) => {
+    if (!window.confirm(`Disconnect ${item.institutionName}? Its stored statements will no longer be available here.`)) return;
     deleteItem.mutate({ id: item.id }, {
       onSuccess: () => {
         if (selectedBankId === item.id) setSelectedBankId(undefined);
@@ -156,460 +222,299 @@ export default function BankSpending() {
 
   const submitStatementUpload = () => {
     if (!selectedBankId || !statementFile) return;
-    uploadStatement.mutate(
-      { itemId: selectedBankId, file: statementFile },
+    uploadStatement.mutate({ itemId: selectedBankId, file: statementFile }, {
+      onSuccess: () => {
+        setStatementFile(undefined);
+        setStatementUploadOpen(false);
+        queryClient.invalidateQueries({ queryKey: ['plaid-statements', selectedBankId] });
+      },
+    });
+  };
+
+  const rowsForTab = useMemo(() => {
+    return allTransactions.filter((transaction) => {
+      return transactionDisposition(transaction) === tab;
+    });
+  }, [allTransactions, tab]);
+
+  const filteredTransactions = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    return rowsForTab.filter((transaction) => {
+      const id = transactionKey(transaction);
+      const text = [transaction.name, transaction.merchantName, transaction.accountName, transaction.institutionName, transaction.category].filter(Boolean).join(' ').toLowerCase();
+      const isReviewed = Boolean(reviews[id]);
+      const hasClass = Boolean(transaction.category || reviews[id] === 'categorized');
+      return (!normalizedQuery || text.includes(normalizedQuery))
+        && dateIsWithin(transaction.date, dateRange)
+        && (statusFilter === 'all' || (statusFilter === 'reviewed' ? isReviewed : !isReviewed))
+        && (classFilter === 'all' || (classFilter === 'classified' ? hasClass : !hasClass));
+    });
+  }, [classFilter, dateRange, query, reviews, rowsForTab, statusFilter]);
+
+  const pendingCount = Number(transactionFeed.counts?.pending || 0);
+  const postedCount = Number(transactionFeed.counts?.posted || 0);
+  const excludedCount = Number(transactionFeed.counts?.excluded || 0);
+  const currentIds = filteredTransactions.map(transactionKey);
+  const allSelected = currentIds.length > 0 && currentIds.every((id) => selectedRows.has(id));
+
+  const toggleRow = (id: string) => {
+    setSelectedRows((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAll = () => {
+    setSelectedRows((current) => {
+      const next = new Set(current);
+      if (allSelected) currentIds.forEach((id) => next.delete(id));
+      else currentIds.forEach((id) => next.add(id));
+      return next;
+    });
+  };
+
+  const setDisposition = (ids: string[], reviewStatus: ReviewStatus) => {
+    if (!selectedBankId || !ids.length) return;
+    updateTransactionReview.mutate(
+      { itemId: selectedBankId, transactionIds: ids, reviewStatus },
       {
         onSuccess: () => {
-          setStatementFile(undefined);
-          setStatementUploadOpen(false);
-          queryClient.invalidateQueries({ queryKey: ['plaid-statements', selectedBankId] });
+          setSelectedRows(new Set());
+          refreshPlaidData();
+          setNotice(`${ids.length} transaction${ids.length === 1 ? '' : 's'} moved to ${reviewStatus}.`);
         },
+        onError: () => setNotice('That review update could not be saved. Try again.'),
       },
     );
   };
 
-  const formatFileSize = (bytes: number) => {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  const reviewRow = (id: string, review: RowReview) => {
+    setReviews((current) => ({ ...current, [id]: review }));
+    setNotice(review === 'matched' ? 'Transaction marked as matched.' : 'Transaction marked for categorization.');
   };
 
+  const exportTransactions = () => {
+    if (!filteredTransactions.length) {
+      setNotice('There are no transactions in this view to export.');
+      return;
+    }
+    const headers = ['Date', 'Description', 'Spent', 'Received', 'Account', 'Class', 'Location', 'Status'];
+    const lines = filteredTransactions.map((transaction) => {
+      const amount = Number(transaction.amount || 0);
+      return [transaction.date, transaction.merchantName || transaction.name, amount > 0 ? amount.toFixed(2) : Math.abs(amount).toFixed(2), amount > 0 ? amount.toFixed(2) : '', transaction.accountName || '', transaction.category || '', transaction.location || '', tab].map((value) => `"${String(value ?? '').replaceAll('"', '""')}"`).join(',');
+    });
+    const blob = new Blob([[headers.join(','), ...lines].join('\n')], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `finsys-${tab}-transactions.csv`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    setNotice(`${filteredTransactions.length} transaction${filteredTransactions.length === 1 ? '' : 's'} exported.`);
+  };
+
+  const formatFileSize = (bytes: number) => bytes < 1024 ? `${bytes} B` : bytes < 1024 * 1024 ? `${Math.round(bytes / 1024)} KB` : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+
   return (
-    <>
-      <PageHeader title="Bank Transaction" description="Bank connections, manual bank profiles, and posted or unposted transaction review">
-        {banks.length > 0 && (
-          <div className="flex flex-row items-start gap-2">
-            {banks.map((item) => (
-              <div key={item.id} className="flex flex-col items-center gap-0.5">
-                <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    type="button"
-                    size="icon"
-                    variant="outline"
-                    className={`relative size-9 rounded-md p-1 ${selectedBankId === item.id ? 'border-primary bg-primary/10' : ''}`}
-                    aria-label={`Open ${item.institutionName}`}
-                    title={`${item.institutionName}${item.hasBalance ? ` · ${item.balanceCurrency || 'USD'} ${item.currentBalance}` : ''}`}
-                  >
-                    <BankMark item={item} compact />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-64">
-                  <DropdownMenuLabel className="flex items-center gap-2">
-                    <BankMark item={item} compact />
-                    <span className="truncate">{item.institutionName}</span>
-                  </DropdownMenuLabel>
-                  <DropdownMenuItem onSelect={() => setSelectedBankId(item.id)}>
-                    View unposted transactions
-                  </DropdownMenuItem>
-                  {!item.isManual && (
-                    <DropdownMenuItem
-                      disabled={syncItem.isPending}
-                      onSelect={() => syncItem.mutate({ id: item.id }, { onSuccess: refreshPlaidData })}
-                    >
-                      <RefreshCw className="size-4" />
-                      Sync bank
-                    </DropdownMenuItem>
-                  )}
-                  <DropdownMenuItem onSelect={() => openStatementUpload(item.id)}>
-                    <Upload className="size-4" />
-                    Upload bank statement
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem className="text-destructive focus:text-destructive" onSelect={() => disconnectBank(item)}>
-                    <Trash2 className="size-4" />
-                    Disconnect bank
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-                </DropdownMenu>
-                <span className={`text-[10px] font-medium leading-3 ${item.unpostedCount > 0 ? 'text-destructive' : 'text-muted-foreground'}`}>
-                  {item.unpostedCount > 99 ? '99+' : item.unpostedCount || 0}
-                </span>
-              </div>
-            ))}
-            <Button type="button" size="icon" variant="outline" title="Add bank without API" aria-label="Add bank without API" onClick={() => setManualBankOpen(true)}>
-              <Plus className="size-4" />
-            </Button>
-            <Button
-              type="button"
-              size="icon"
-              title="Connect another bank"
-              aria-label="Connect another bank"
-              onClick={connectBank}
-              disabled={!plaidStatus?.configured || createLinkToken.isPending || exchangeToken.isPending}
-            >
-              <Link2 className="size-4" />
-            </Button>
-          </div>
-        )}
+    <div className="min-h-[100dvh] bg-[#f4f6f3] text-[#1b2d35]">
+      <PageHeader title="Bank transactions" description="Review connected activity, post cleanly, and keep the audit trail intact.">
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <a href="/bank-spending?version=previous" className="hidden text-xs text-[#61706e] underline-offset-4 transition-colors hover:text-[#1f5d63] hover:underline sm:inline-flex">Previous version</a>
+          <a href="/bank-register" className="hidden text-xs text-[#61706e] underline-offset-4 transition-colors hover:text-[#1f5d63] hover:underline sm:inline-flex">Bank register <ChevronRight className="ml-0.5 size-3" /></a>
+          <span className="mx-1 hidden h-4 w-px bg-[#d4ddd9] sm:block" />
+          <Button variant="outline" size="sm" onClick={() => window.print()}><Printer className="size-3.5" />Print</Button>
+          <Button variant="outline" size="sm" onClick={exportTransactions}><Download className="size-3.5" />Export</Button>
+          <Button variant="outline" size="icon" className="size-8" title="Transaction table settings" aria-label="Transaction table settings" onClick={() => setNotice('Use the column menu beside the table to customize visible fields.')}><Settings2 className="size-3.5" /></Button>
+        </div>
       </PageHeader>
+
       <PageContent>
-        {banks.length === 0 && <Card className="rounded-sm mb-6 border-primary/30">
-          <CardHeader className="flex flex-row items-start justify-between gap-4 space-y-0">
-            <div>
-              <CardTitle className="text-sm font-semibold flex items-center gap-2">
-                <Landmark className="size-4" />
-                Connected Banks
-              </CardTitle>
-              <p className="text-xs text-muted-foreground mt-1">
-                Securely connect a supported institution through Plaid and sync transactions for review.
-              </p>
-            </div>
-            <div className="flex flex-wrap justify-end gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => setManualBankOpen(true)}
-              >
-                <Plus className="size-4 mr-2" />
-                Add Bank Without API
-              </Button>
-              <Button
-                size="sm"
-                onClick={connectBank}
-                disabled={!plaidStatus?.configured || createLinkToken.isPending || exchangeToken.isPending}
-              >
-                <Link2 className="size-4 mr-2" />
-                {createLinkToken.isPending ? 'Preparing…' : (plaidItems as any[])?.length ? 'Connect Another Bank' : 'Connect Bank'}
-              </Button>
-            </div>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            {!plaidStatus?.configured && (
-              <div className="rounded-sm border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-                Plaid credentials are not configured. Add PLAID_CLIENT_ID and PLAID_SECRET in Replit Secrets.
+        <div className="space-y-5 pb-12">
+          <section className="rounded-lg border border-[#cedbd6] bg-[#fbfcfa] shadow-[0_8px_24px_rgba(31,65,65,0.04)]">
+            <div className="flex flex-col gap-4 border-b border-[#dce5e1] px-4 py-4 sm:px-5 lg:flex-row lg:items-center lg:justify-between">
+              <div className="flex items-start gap-3">
+                <div className="mt-0.5 flex size-9 items-center justify-center rounded-md bg-[#d9e9e4] text-[#1f5d63]"><Landmark className="size-[18px]" /></div>
+                <div>
+                  <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-[#70807c]">Connected accounts</p>
+                  <h2 className="mt-1 text-[15px] font-semibold tracking-[-0.01em] text-[#1b2d35]">Choose a feed to review</h2>
+                </div>
               </div>
-            )}
-            <div className="rounded-sm border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-              Connect multiple institutions one at a time—each linked bank stays listed separately. For GCC and Pakistan banks that are not available in Plaid, use “Add Bank Without API” to save a bank profile without inventing live balances or transactions.
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" variant="outline" onClick={() => setManualBankOpen(true)}><Plus className="size-3.5" />Add manual bank</Button>
+                <Button size="sm" onClick={connectBank} disabled={!plaidStatus?.configured || createLinkToken.isPending || exchangeToken.isPending}>
+                  <Link2 className="size-3.5" />{createLinkToken.isPending ? 'Preparing…' : 'Connect bank'}
+                </Button>
+              </div>
             </div>
-            {(plaidItems || []).length === 0 ? (
-              <div className="text-sm text-muted-foreground py-3">No banks connected yet.</div>
+
+            {isLoadingBanks || isLoadingStatus ? (
+              <div className="grid gap-3 p-4 sm:grid-cols-2 xl:grid-cols-3">
+                {[1, 2, 3].map((item) => <Skeleton key={item} className="h-[126px] rounded-md bg-[#e6eeea]" />)}
+              </div>
+            ) : isBanksError ? (
+              <div className="flex flex-col items-center justify-center gap-3 px-5 py-10 text-center">
+                <CircleAlert className="size-7 text-[#b36b3a]" />
+                <div><p className="text-sm font-semibold">Bank feeds could not be loaded</p><p className="mt-1 text-xs text-[#687773]">The connection service did not respond. Nothing was changed.</p></div>
+                <Button size="sm" variant="outline" onClick={refreshPlaidData}><RefreshCw className="size-3.5" />Try again</Button>
+              </div>
+            ) : banks.length === 0 ? (
+              <div className="flex flex-col items-center justify-center px-5 py-12 text-center">
+                <div className="mb-3 flex size-12 items-center justify-center rounded-full border border-dashed border-[#9db8b1] bg-[#edf4f0] text-[#397379]"><WalletCards className="size-5" /></div>
+                <p className="text-sm font-semibold text-[#23373d]">No bank feeds connected</p>
+                <p className="mt-1 max-w-md text-xs leading-5 text-[#687773]">Connect a supported institution through Plaid, or add a manual profile for a bank without an API connection.</p>
+                {!plaidStatus?.configured && <p className="mt-3 rounded-md border border-[#e5c9aa] bg-[#fff7ec] px-3 py-2 text-left text-xs text-[#9b6234]">Plaid credentials are not configured. A manual bank profile is still available.</p>}
+              </div>
             ) : (
-              <div className="space-y-2">
-                {(plaidItems as any[]).map((item) => (
-                  <div
-                    key={item.id}
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => setSelectedBankId(item.id)}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter' || event.key === ' ') setSelectedBankId(item.id);
-                    }}
-                    className={`flex cursor-pointer flex-wrap items-center justify-between gap-3 rounded-sm border px-3 py-2 transition-colors hover:bg-muted/30 ${selectedBankId === item.id ? 'border-primary bg-primary/5' : ''}`}
-                  >
-                    <div className="flex items-center gap-3">
-                      <BankMark item={item} />
-                      <div>
-                        <div className="font-medium text-sm">{item.institutionName}</div>
-                        <div className="text-xs text-muted-foreground">
-                          {item.accountCount} account{item.accountCount === 1 ? '' : 's'}
-                          {item.country ? ` · ${MANUAL_BANK_COUNTRIES.find((country) => country.value === item.country)?.label || item.country}` : ''}
+              <div className="overflow-x-auto p-4 sm:p-5">
+                <div className="flex min-w-max gap-3">
+                  {banks.map((item) => {
+                    const itemAccounts = accounts.filter((account) => account.institutionName === item.institutionName || account.plaidItemId === item.id);
+                    const active = selectedBankId === item.id;
+                    return (
+                      <button key={item.id} type="button" onClick={() => setSelectedBankId(item.id)} className={`group w-[255px] rounded-md border p-3.5 text-left transition-[border-color,background-color,box-shadow,transform] duration-200 hover:-translate-y-0.5 hover:border-[#8aada7] hover:shadow-[0_7px_16px_rgba(31,65,65,0.08)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#397379] ${active ? 'border-[#397379] bg-[#eef6f2] shadow-[inset_3px_0_0_#397379]' : 'border-[#d6e0dc] bg-[#fdfefd]'}`}>
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="flex min-w-0 items-center gap-2.5"><BankMark item={item} /><span className="min-w-0 truncate text-sm font-semibold text-[#23373d]">{item.institutionName}</span></div>
+                          <span className={`mt-1 size-1.5 rounded-full ${item.isManual ? 'bg-[#b7834c]' : 'bg-[#4e9587]'}`} title={item.isManual ? 'Manual bank profile' : 'Connected and active'} />
                         </div>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <div className="mr-3 text-right">
-                        <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Current balance</div>
-                        <div className="font-mono text-sm font-semibold">
-                          {item.hasBalance
-                            ? <FormatCurrency amount={item.currentBalance} currency={item.balanceCurrency || 'USD'} decimals={2} />
-                            : <span className="text-xs font-normal text-muted-foreground">Unavailable</span>}
+                        <div className="mt-3 grid grid-cols-2 gap-3 border-t border-[#dce6e1] pt-3">
+                          <div><p className="font-mono text-[9px] uppercase tracking-[0.1em] text-[#7b8985]">Synced balance</p><p className="mt-1 font-mono text-[13px] font-semibold tabular-nums text-[#21383d]">{item.hasBalance ? <FormatCurrency amount={item.currentBalance} currency={item.balanceCurrency || 'USD'} decimals={2} /> : '—'}</p></div>
+                          <div><p className="font-mono text-[9px] uppercase tracking-[0.1em] text-[#7b8985]">FinSys / posted</p><p className="mt-1 font-mono text-[13px] font-semibold tabular-nums text-[#21383d]">{item.hasBalance && item.availableBalance !== null && item.availableBalance !== undefined ? <FormatCurrency amount={item.availableBalance} currency={item.balanceCurrency || 'USD'} decimals={2} /> : '—'}</p></div>
                         </div>
-                      </div>
-                      <Badge variant="secondary">{item.isManual ? 'Manual Bank' : 'Plaid Linked'}</Badge>
-                      {!item.isManual && (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            syncItem.mutate({ id: item.id }, { onSuccess: refreshPlaidData });
-                          }}
-                          disabled={syncItem.isPending}
-                        >
-                          <RefreshCw className={`size-4 mr-2 ${syncItem.isPending ? 'animate-spin' : ''}`} />
-                          Sync
-                        </Button>
-                      )}
-                      <Button
-                        size="icon"
-                        variant="ghost"
-                        aria-label={`Disconnect ${item.institutionName}`}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          deleteItem.mutate({ id: item.id }, {
-                            onSuccess: () => {
-                              if (selectedBankId === item.id) setSelectedBankId(undefined);
-                              refreshPlaidData();
-                            },
-                          });
-                        }}
-                      >
-                        <Trash2 className="size-4 text-muted-foreground" />
-                      </Button>
-                    </div>
-                  </div>
-                ))}
+                        <div className="mt-3 flex items-center justify-between gap-2 text-[10px] text-[#6e7c78]">
+                          <span className="inline-flex items-center gap-1.5"><span className="size-1.5 rounded-full bg-[#4e9587]" />{item.isManual ? 'Manual profile' : 'Connected'} · {itemAccounts.length || item.accountCount || 0} account{(itemAccounts.length || item.accountCount || 0) === 1 ? '' : 's'}</span>
+                          <span className={item.pendingCount ? 'font-semibold text-[#ae623f]' : ''}>{item.pendingCount || 0} to review</span>
+                        </div>
+                      </button>
+                    );
+                  })}
+                  <button type="button" onClick={() => setManualBankOpen(true)} className="flex w-[150px] shrink-0 flex-col items-center justify-center gap-2 rounded-md border border-dashed border-[#b4c8c1] bg-[#f7faf8] text-xs font-semibold text-[#53706c] transition-colors hover:border-[#397379] hover:bg-[#edf5f1] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#397379]"><Plus className="size-4" />Add bank</button>
+                </div>
               </div>
             )}
-            {(plaidAccounts as any[])?.length > 0 && (
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2">
-                {(plaidAccounts as any[]).map((account) => (
-                  <div key={account.plaidAccountId} className="rounded-sm bg-muted/30 px-3 py-2 text-xs">
-                    <div className="font-medium">{account.name} {account.mask ? `••${account.mask}` : ''}</div>
-                    <div className="text-muted-foreground">{account.institutionName} · {account.subtype || account.type}</div>
-                    <div className="mt-1 font-mono font-medium">
-                      {account.currentBalance !== null && account.currentBalance !== undefined
-                        ? <FormatCurrency amount={account.currentBalance} currency={account.isoCurrency || 'USD'} decimals={2} />
-                        : <span className="text-muted-foreground">Balance unavailable</span>}
-                    </div>
-                  </div>
-                ))}
+            {banks.length > 0 && selectedBank && (
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#dce5e1] bg-[#f4f8f5] px-4 py-2.5 text-xs sm:px-5">
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[#64736f]"><span className="inline-flex items-center gap-1.5"><span className="size-1.5 rounded-full bg-[#4e9587]" />{selectedBank.isManual ? 'Manual profile' : 'Connection healthy'}</span><span>Last update {selectedBank.updatedAt ? new Date(selectedBank.updatedAt).toLocaleString() : 'not available'}</span></div>
+                <div className="flex items-center gap-2">
+                  {!selectedBank.isManual && <Button variant="ghost" size="sm" className="h-7 px-2 text-xs text-[#397379]" onClick={() => syncItem.mutate({ id: selectedBank.id }, { onSuccess: refreshPlaidData })} disabled={syncItem.isPending}><RefreshCw className={`size-3 ${syncItem.isPending ? 'animate-spin' : ''}`} />Update feed</Button>}
+                  <Button variant="ghost" size="sm" className="h-7 px-2 text-xs text-[#397379]" onClick={() => openStatementUpload(selectedBank.id)}><Upload className="size-3" />Upload statement</Button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild><Button variant="ghost" size="icon" className="size-7 text-[#64736f]" aria-label="Bank actions"><MoreHorizontal className="size-4" /></Button></DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-48">
+                      <DropdownMenuLabel>{selectedBank.institutionName}</DropdownMenuLabel>
+                      <DropdownMenuItem onSelect={() => setSelectedBankId(selectedBank.id)}>View transactions</DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem className="text-destructive focus:text-destructive" onSelect={() => disconnectBank(selectedBank)}><Trash2 className="size-3.5" />Disconnect bank</DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
               </div>
             )}
-          </CardContent>
-          </Card>}
+          </section>
 
-        <div className={banks.length > 0 ? 'space-y-6' : ''}>
-          {banks.length > 0 && (
-            <Card className="rounded-sm">
-              <CardHeader>
-                <CardTitle className="text-sm font-semibold">Connected Banks</CardTitle>
-                <p className="text-xs text-muted-foreground">Select a bank to review its transactions.</p>
-              </CardHeader>
-              <CardContent className="space-y-2">
-                {banks.map((item) => (
-                  <div key={item.id} className={`flex w-full items-center gap-3 rounded-md border p-3 transition-colors hover:bg-muted/30 ${selectedBankId === item.id ? 'border-primary bg-primary/5' : ''}`}>
-                    <button
-                      type="button"
-                      onClick={() => setSelectedBankId(item.id)}
-                      className="flex min-w-0 flex-1 items-center gap-3 text-left"
-                    >
-                      <BankMark item={item} large />
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-sm font-semibold">{item.institutionName}</span>
-                        <span className="mt-0.5 block text-xs text-muted-foreground">
-                          {item.isManual ? 'Manual Bank' : 'Plaid Linked'} · {item.unpostedCount || 0} unposted
-                        </span>
-                        <span className="mt-2 block font-mono text-sm font-semibold">
-                          {item.hasBalance
-                            ? <FormatCurrency amount={item.currentBalance} currency={item.balanceCurrency || 'USD'} decimals={2} />
-                            : <span className="text-xs font-normal text-muted-foreground">Balance unavailable</span>}
-                        </span>
-                      </span>
-                    </button>
-                    <Button
-                      type="button"
-                      size="icon"
-                      variant="outline"
-                      title={`Upload a statement for ${item.institutionName}`}
-                      aria-label={`Upload a statement for ${item.institutionName}`}
-                      onClick={() => openStatementUpload(item.id)}
-                    >
-                      <Upload className="size-4" />
-                    </Button>
-                  </div>
+          <section className="rounded-lg border border-[#cedbd6] bg-[#fbfcfa] shadow-[0_8px_24px_rgba(31,65,65,0.04)]">
+            <div className="border-b border-[#dce5e1] px-4 pt-4 sm:px-5">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div><p className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-[#70807c]">Review queue</p><h2 className="mt-1 text-[15px] font-semibold text-[#1b2d35]">{selectedBank ? selectedBank.institutionName : 'Bank activity'}</h2></div>
+                <span className="font-mono text-[10px] text-[#75837f]">Source: connected feed · no synthetic rows</span>
+              </div>
+              <div className="mt-4 flex items-end gap-5 overflow-x-auto">
+                {([['pending', 'Pending', pendingCount], ['posted', 'Posted', postedCount], ['excluded', 'Excluded', excludedCount]] as const).map(([value, label, count]) => (
+                  <button key={value} type="button" onClick={() => setTab(value)} className={`flex shrink-0 items-center gap-2 border-b-2 pb-3 text-xs font-semibold transition-colors ${tab === value ? 'border-[#397379] text-[#1f5d63]' : 'border-transparent text-[#77837f] hover:text-[#2b454a]'}`}><span>{label}</span><CountBadge active={tab === value}>{count}</CountBadge></button>
                 ))}
-              </CardContent>
-            </Card>
-          )}
+              </div>
+            </div>
 
-        <Card className="rounded-sm mb-6">
-          <CardHeader>
-            <CardTitle className="text-sm font-semibold">
-              {selectedBank ? `Unposted Transactions · ${selectedBank.institutionName}` : 'Unposted Transactions'}
-            </CardTitle>
-            <p className="text-xs text-muted-foreground">
-              {selectedBank
-                ? 'Pending transactions from the selected bank. Posted transactions are not shown here.'
-                : 'Select a bank from the left panel or its icon above to view its pending transactions.'}
-            </p>
-          </CardHeader>
-          <CardContent className="p-0">
+            <div className="flex flex-col gap-2 border-b border-[#e0e7e4] bg-[#f6f8f6] p-3 sm:flex-row sm:flex-wrap sm:items-center sm:px-4">
+              <div className="relative min-w-[220px] flex-1 sm:max-w-[310px]"><Search className="pointer-events-none absolute left-2.5 top-2.5 size-3.5 text-[#85918d]" /><Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search description, account…" className="h-8 border-[#d2dfda] bg-[#fcfdfc] pl-8 text-xs shadow-none focus-visible:ring-[#397379]" />{query && <button type="button" onClick={() => setQuery('')} className="absolute right-2 top-2 text-[#85918d] hover:text-[#1f5d63]" aria-label="Clear search"><X className="size-3.5" /></button>}</div>
+              <Select value={dateRange} onValueChange={(value) => setDateRange(value as DateRange)}><SelectTrigger className="h-8 w-full border-[#d2dfda] bg-[#fcfdfc] text-xs shadow-none sm:w-[130px]"><CalendarRange className="mr-1.5 size-3.5 text-[#71817d]" /><SelectValue /></SelectTrigger><SelectContent><SelectItem value="all">All dates</SelectItem><SelectItem value="30">Last 30 days</SelectItem><SelectItem value="90">Last 90 days</SelectItem></SelectContent></Select>
+              <Select value={statusFilter} onValueChange={setStatusFilter}><SelectTrigger className="h-8 w-full border-[#d2dfda] bg-[#fcfdfc] text-xs shadow-none sm:w-[125px]"><Filter className="mr-1.5 size-3.5 text-[#71817d]" /><SelectValue /></SelectTrigger><SelectContent><SelectItem value="all">All status</SelectItem><SelectItem value="unreviewed">Needs review</SelectItem><SelectItem value="reviewed">Reviewed</SelectItem></SelectContent></Select>
+              <Select value={classFilter} onValueChange={setClassFilter}><SelectTrigger className="h-8 w-full border-[#d2dfda] bg-[#fcfdfc] text-xs shadow-none sm:w-[130px]"><ListFilter className="mr-1.5 size-3.5 text-[#71817d]" /><SelectValue /></SelectTrigger><SelectContent><SelectItem value="all">All classes</SelectItem><SelectItem value="classified">Classified</SelectItem><SelectItem value="unclassified">Unclassified</SelectItem></SelectContent></Select>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild><Button variant="outline" size="sm" className="h-8 border-[#d2dfda] bg-[#fcfdfc] text-xs"><SlidersHorizontal className="size-3.5" />Columns<ChevronDown className="size-3" /></Button></DropdownMenuTrigger>
+                <DropdownMenuContent align="end"><DropdownMenuLabel>Show columns</DropdownMenuLabel><DropdownMenuCheckboxItem checked={visibleColumns.class} onCheckedChange={(checked) => setVisibleColumns((current) => ({ ...current, class: Boolean(checked) }))}>Class</DropdownMenuCheckboxItem><DropdownMenuCheckboxItem checked={visibleColumns.location} onCheckedChange={(checked) => setVisibleColumns((current) => ({ ...current, location: Boolean(checked) }))}>Location</DropdownMenuCheckboxItem><DropdownMenuCheckboxItem checked={visibleColumns.account} onCheckedChange={(checked) => setVisibleColumns((current) => ({ ...current, account: Boolean(checked) }))}>Account</DropdownMenuCheckboxItem></DropdownMenuContent>
+              </DropdownMenu>
+              <div className="ml-auto flex items-center gap-2 text-[10px] text-[#7a8884]"><span className="hidden sm:inline">{filteredTransactions.length} shown</span><Button variant="ghost" size="icon" className="size-8" title="Refresh transactions" aria-label="Refresh transactions" onClick={() => refetchTransactions()}><RefreshCw className={`size-3.5 ${isLoadingUnposted ? 'animate-spin' : ''}`} /></Button></div>
+            </div>
+
+            {selectedRows.size > 0 && (
+              <div className="flex flex-wrap items-center gap-2 border-b border-[#dce5e1] bg-[#edf5f1] px-3 py-2.5 sm:px-4">
+                <span className="mr-2 font-mono text-xs font-semibold text-[#1f5d63]">{selectedRows.size} selected</span>
+                {tab === 'pending' && <><Button size="sm" className="h-7 bg-[#28666c] px-2.5 text-[11px]" onClick={() => setDisposition(Array.from(selectedRows), 'posted')}><ClipboardCheck className="size-3.5" />Mark posted</Button><Button size="sm" variant="outline" className="h-7 border-[#c6d8d1] px-2.5 text-[11px]" onClick={() => setDisposition(Array.from(selectedRows), 'excluded')}>Exclude</Button></>}
+                {tab !== 'pending' && <Button size="sm" variant="outline" className="h-7 border-[#c6d8d1] px-2.5 text-[11px]" onClick={() => setDisposition(Array.from(selectedRows), 'pending')}>Return to pending</Button>}
+                <button type="button" className="ml-auto text-xs text-[#61706e] hover:text-[#1f5d63]" onClick={() => setSelectedRows(new Set())}>Clear</button>
+              </div>
+            )}
+
             {!selectedBank ? (
-              <div className="px-4 py-8 text-center text-sm text-muted-foreground">Select a bank to view its unposted transactions.</div>
+              <div className="flex flex-col items-center justify-center px-5 py-16 text-center"><Landmark className="mb-3 size-7 text-[#98aaa4]" /><p className="text-sm font-semibold text-[#42575a]">Select a bank feed to begin</p><p className="mt-1 text-xs text-[#77847f]">Your pending activity will appear here once an account is selected.</p></div>
             ) : isLoadingUnposted ? (
-              <div className="p-4"><Skeleton className="h-16 w-full" /></div>
-            ) : !(unpostedTransactions as any[])?.length ? (
-              <div className="px-4 py-8 text-center text-sm text-muted-foreground">
-                No unposted transactions for {selectedBank.institutionName}.
-              </div>
+              <div className="space-y-2 p-4">{[1, 2, 3, 4, 5].map((item) => <Skeleton key={item} className="h-12 rounded-md bg-[#e7efeb]" />)}</div>
+            ) : isTransactionsError ? (
+              <div className="flex flex-col items-center justify-center gap-3 px-5 py-14 text-center"><CircleAlert className="size-7 text-[#b36b3a]" /><div><p className="text-sm font-semibold">Transactions are temporarily unavailable</p><p className="mt-1 text-xs text-[#77847f]">Try the feed again. Saved review decisions will remain available.</p></div><Button size="sm" variant="outline" onClick={() => refetchTransactions()}><RefreshCw className="size-3.5" />Retry</Button></div>
+            ) : filteredTransactions.length === 0 ? (
+              <div className="flex flex-col items-center justify-center px-5 py-16 text-center"><div className="mb-3 flex size-10 items-center justify-center rounded-full bg-[#edf4f0] text-[#397379]"><Check className="size-5" /></div><p className="text-sm font-semibold text-[#42575a]">{tab === 'pending' ? 'Nothing needs posting' : `No ${tab} transactions in this view`}</p><p className="mt-1 max-w-sm text-xs leading-5 text-[#77847f]">{tab === 'pending' ? 'This feed is clear for now. New activity will appear after the next update.' : 'Transactions move here only when you review them on this page; no records are fabricated.'}</p>{(query || dateRange !== 'all' || statusFilter !== 'all' || classFilter !== 'all') && <Button size="sm" variant="ghost" className="mt-3 text-xs text-[#397379]" onClick={() => { setQuery(''); setDateRange('all'); setStatusFilter('all'); setClassFilter('all'); }}>Clear filters</Button>}</div>
             ) : (
               <div className="overflow-x-auto">
-                <Table>
-                  <TableHeader>
-                    <TableRow className="bg-sidebar">
-                      <TableHead className="font-mono text-xs text-sidebar-foreground">Date</TableHead>
-                      <TableHead className="font-mono text-xs text-sidebar-foreground">Merchant</TableHead>
-                      <TableHead className="font-mono text-xs text-sidebar-foreground">Account</TableHead>
-                      <TableHead className="font-mono text-xs text-right text-sidebar-foreground">Amount</TableHead>
-                      <TableHead className="font-mono text-xs text-sidebar-foreground">Status</TableHead>
-                    </TableRow>
-                  </TableHeader>
+                <Table className="min-w-[1030px]">
+                  <TableHeader><TableRow className="border-[#dce5e1] bg-[#f7f9f7] hover:bg-[#f7f9f7]"><TableHead className="w-10 px-4"><input type="checkbox" aria-label="Select all transactions" checked={allSelected} onChange={toggleAll} className="size-3.5 accent-[#397379]" /></TableHead><TableHead className="w-[92px] font-mono text-[10px] uppercase tracking-wider text-[#75837f]">Date</TableHead><TableHead className="min-w-[230px] font-mono text-[10px] uppercase tracking-wider text-[#75837f]">Bank description</TableHead><TableHead className="w-[112px] text-right font-mono text-[10px] uppercase tracking-wider text-[#75837f]">Spent</TableHead><TableHead className="w-[112px] text-right font-mono text-[10px] uppercase tracking-wider text-[#75837f]">Received</TableHead>{visibleColumns.account && <TableHead className="w-[145px] font-mono text-[10px] uppercase tracking-wider text-[#75837f]">From / To</TableHead>}{visibleColumns.class && <TableHead className="w-[130px] font-mono text-[10px] uppercase tracking-wider text-[#75837f]">Class</TableHead>}{visibleColumns.location && <TableHead className="w-[120px] font-mono text-[10px] uppercase tracking-wider text-[#75837f]">Location</TableHead>}<TableHead className="w-[145px] font-mono text-[10px] uppercase tracking-wider text-[#75837f]">Match / categorize</TableHead><TableHead className="w-12" /></TableRow></TableHeader>
                   <TableBody>
-                    {(unpostedTransactions as any[]).map((transaction) => (
-                      <TableRow key={transaction.plaidTransactionId}>
-                        <TableCell className="text-xs">{transaction.date}</TableCell>
-                        <TableCell className="text-sm font-medium">{transaction.merchantName || transaction.name}</TableCell>
-                        <TableCell className="text-xs text-muted-foreground">{transaction.accountName || transaction.institutionName}</TableCell>
-                        <TableCell className="text-right font-mono text-sm">
-                          <FormatCurrency amount={transaction.amount} currency={transaction.isoCurrency || 'USD'} decimals={2} />
-                        </TableCell>
-                        <TableCell><Badge variant="outline">Unposted</Badge></TableCell>
-                      </TableRow>
-                    ))}
+                    {filteredTransactions.map((transaction) => {
+                      const id = transactionKey(transaction);
+                      const amount = Number(transaction.amount || 0);
+                      const expanded = expandedRows.has(id);
+                      const review = reviews[id];
+                      return (
+                        <React.Fragment key={id}>
+                          <TableRow data-state={selectedRows.has(id) ? 'selected' : undefined} className={`group border-[#e2e9e6] ${selectedRows.has(id) ? 'bg-[#edf5f1]' : ''}`}>
+                            <TableCell className="px-4"><input type="checkbox" aria-label={`Select ${transaction.name || 'transaction'}`} checked={selectedRows.has(id)} onChange={() => toggleRow(id)} className="size-3.5 accent-[#397379]" /></TableCell>
+                            <TableCell className="whitespace-nowrap font-mono text-[11px] tabular-nums text-[#586b6c]">{formatDate(transaction.date)}</TableCell>
+                            <TableCell><button type="button" className="flex max-w-[270px] items-center gap-2 text-left" onClick={() => setExpandedRows((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })}><span className={`flex size-5 shrink-0 items-center justify-center rounded-sm ${amount < 0 ? 'bg-[#fff0e7] text-[#b66d40]' : 'bg-[#e4f1ed] text-[#2c7771]'}`}>{amount < 0 ? <ArrowUpRight className="size-3" /> : <ArrowDownLeft className="size-3" />}</span><span className="min-w-0"><span className="block truncate text-xs font-semibold text-[#293d42] group-hover:text-[#1f5d63]">{transaction.merchantName || transaction.name || 'Unnamed transaction'}</span><span className="block truncate text-[10px] text-[#7a8884]">{transaction.institutionName || selectedBank.institutionName}{transaction.pending ? ' · Pending at bank' : ''}</span></span></button></TableCell>
+                            <TableCell className="text-right font-mono text-xs tabular-nums text-[#9d5f3b]">{amount < 0 ? <FormatCurrency amount={Math.abs(amount)} currency={transaction.isoCurrency || 'USD'} decimals={2} /> : <span className="text-[#a6b0ac]">—</span>}</TableCell>
+                            <TableCell className="text-right font-mono text-xs tabular-nums text-[#34756e]">{amount > 0 ? <FormatCurrency amount={amount} currency={transaction.isoCurrency || 'USD'} decimals={2} /> : <span className="text-[#a6b0ac]">—</span>}</TableCell>
+                            {visibleColumns.account && <TableCell className="max-w-[145px] truncate text-xs text-[#586b6c]">{transaction.accountName || '—'}</TableCell>}
+                            {visibleColumns.class && <TableCell>{transaction.category ? <span className="rounded-sm bg-[#edf2ef] px-1.5 py-1 text-[10px] text-[#526966]">{transaction.category}</span> : <span className="text-[11px] text-[#9aaba5]">Unassigned</span>}</TableCell>}
+                            {visibleColumns.location && <TableCell className="max-w-[120px] truncate text-xs text-[#687875]">{transaction.location || '—'}</TableCell>}
+                            <TableCell><div className="flex items-center gap-1.5">{review ? <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-[#397379]"><Check className="size-3" />{review === 'matched' ? 'Matched' : 'Categorized'}</span> : <><Button variant="ghost" size="sm" className="h-7 px-2 text-[10px] text-[#397379]" onClick={() => reviewRow(id, 'matched')}>Match</Button><Button variant="ghost" size="sm" className="h-7 px-2 text-[10px] text-[#697a75]" onClick={() => reviewRow(id, 'categorized')}>Categorize</Button></>}</div></TableCell>
+                            <TableCell><button type="button" onClick={() => setExpandedRows((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })} className="flex size-7 items-center justify-center rounded-sm text-[#80908b] transition-colors hover:bg-[#e8f0ec] hover:text-[#397379]" aria-label={expanded ? 'Collapse transaction details' : 'Expand transaction details'}>{expanded ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}</button></TableCell>
+                          </TableRow>
+                          {expanded && <TableRow className="bg-[#f5f9f6] hover:bg-[#f5f9f6]"><TableCell colSpan={10} className="px-12 py-3"><div className="grid max-w-4xl gap-3 text-xs sm:grid-cols-4"><div><p className="font-mono text-[9px] uppercase tracking-wider text-[#879590]">Transaction ID</p><p className="mt-1 break-all font-mono text-[10px] text-[#526966]">{transaction.plaidTransactionId || 'Not provided'}</p></div><div><p className="font-mono text-[9px] uppercase tracking-wider text-[#879590]">Authorized date</p><p className="mt-1 text-[#526966]">{formatDate(transaction.authorizedDate)}</p></div><div><p className="font-mono text-[9px] uppercase tracking-wider text-[#879590]">Bank account</p><p className="mt-1 text-[#526966]">{transaction.accountName || 'Not provided'}</p></div><div><p className="font-mono text-[9px] uppercase tracking-wider text-[#879590]">Review status</p><p className="mt-1 text-[#526966]">{review || 'Needs review'}</p></div></div></TableCell></TableRow>}
+                        </React.Fragment>
+                      );
+                    })}
                   </TableBody>
                 </Table>
               </div>
             )}
-          </CardContent>
-        </Card>
-        {selectedBank && (
-          <Card className="rounded-sm">
-            <CardHeader className="flex flex-row items-start justify-between gap-4 space-y-0">
-              <div>
-                <CardTitle className="text-sm font-semibold flex items-center gap-2">
-                  <FileText className="size-4" />
-                  Uploaded Statements
-                </CardTitle>
-                <p className="text-xs text-muted-foreground mt-1">
-                  Statements stored for {selectedBank.institutionName}.
-                </p>
-              </div>
-              <Button type="button" size="sm" variant="outline" onClick={() => openStatementUpload(selectedBank.id)}>
-                <Upload className="size-4 mr-2" />
-                Upload Statement
-              </Button>
-            </CardHeader>
-            <CardContent>
-              {isLoadingStatements ? (
-                <Skeleton className="h-10 w-full" />
-              ) : !(statements as any[])?.length ? (
-                <p className="text-sm text-muted-foreground">No statements uploaded for this bank yet.</p>
-              ) : (
-                <div className="space-y-2">
-                  {(statements as any[]).map((statement) => (
-                    <div key={statement.id} className="flex items-center justify-between gap-3 rounded-md border px-3 py-2">
-                      <div className="flex min-w-0 items-center gap-2">
-                        <FileText className="size-4 shrink-0 text-muted-foreground" />
-                        <div className="min-w-0">
-                          <div className="truncate text-sm font-medium">{statement.originalName}</div>
-                          <div className="text-xs text-muted-foreground">
-                            {formatFileSize(statement.fileSize)} · {new Date(statement.createdAt).toLocaleString()}
-                          </div>
-                        </div>
-                      </div>
-                      <a
-                        href={`/api/plaid/statements/${statement.id}/download`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex size-8 shrink-0 items-center justify-center rounded-md border text-muted-foreground hover:bg-muted"
-                        aria-label={`Download ${statement.originalName}`}
-                        title="Download statement"
-                      >
-                        <Download className="size-4" />
-                      </a>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        )}
+            <div className="flex flex-col gap-2 border-t border-[#e0e7e4] px-4 py-3 text-[10px] text-[#84918d] sm:flex-row sm:items-center sm:justify-between"><span>Showing {filteredTransactions.length} of {rowsForTab.length} {tab} transaction{rowsForTab.length === 1 ? '' : 's'}</span><span className="inline-flex items-center gap-1.5"><span className="size-1.5 rounded-full bg-[#4e9587]" />Review decisions are saved to this bank feed.</span></div>
+          </section>
+
+          {selectedBank && (
+            <section className="rounded-lg border border-[#cedbd6] bg-[#fbfcfa]">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#dce5e1] px-4 py-3 sm:px-5"><div className="flex items-center gap-2"><FileText className="size-4 text-[#397379]" /><div><h2 className="text-sm font-semibold text-[#2a3e43]">Statement archive</h2><p className="text-[10px] text-[#7a8884]">{selectedBank.institutionName} · source documents for audit</p></div></div><Button size="sm" variant="outline" onClick={() => openStatementUpload(selectedBank.id)}><Upload className="size-3.5" />Upload statement</Button></div>
+              <div className="p-4 sm:p-5">{isLoadingStatements ? <Skeleton className="h-10 w-full bg-[#e7efeb]" /> : !(statements as any[])?.length ? <div className="flex items-center gap-3 rounded-md border border-dashed border-[#c6d7d1] bg-[#f7faf8] px-3 py-4 text-xs text-[#71807b]"><FileText className="size-4 text-[#8ca19a]" /><span>No statements uploaded for this bank yet.</span></div> : <div className="space-y-2">{(statements as any[]).map((statement) => <div key={statement.id} className="flex items-center justify-between gap-3 rounded-md border border-[#e0e8e4] px-3 py-2.5"><div className="flex min-w-0 items-center gap-2"><FileText className="size-4 shrink-0 text-[#78908a]" /><div className="min-w-0"><p className="truncate text-xs font-semibold text-[#465c5e]">{statement.originalName}</p><p className="text-[10px] text-[#879590]">{formatFileSize(statement.fileSize)} · {new Date(statement.createdAt).toLocaleString()}</p></div></div><a href={`/api/plaid/statements/${statement.id}/download`} target="_blank" rel="noreferrer" className="inline-flex size-7 shrink-0 items-center justify-center rounded-sm border border-[#d5e0dc] text-[#607772] transition-colors hover:bg-[#edf5f1] hover:text-[#1f5d63]" aria-label={`Download ${statement.originalName}`}><Download className="size-3.5" /></a></div>)}</div>}</div>
+            </section>
+          )}
         </div>
-
-        <Dialog
-          open={statementUploadOpen}
-          onOpenChange={(open) => {
-            setStatementUploadOpen(open);
-            if (!open) setStatementFile(undefined);
-          }}
-        >
-          <DialogContent className="max-w-md">
-            <DialogHeader>
-              <DialogTitle>Upload Bank Statement</DialogTitle>
-            </DialogHeader>
-            <div className="space-y-4">
-              <p className="text-sm text-muted-foreground">
-                Upload a statement for {selectedBank?.institutionName || 'the selected bank'}. The file will be stored with this bank for review.
-              </p>
-              <div className="space-y-2">
-                <Label htmlFor="bank-statement-file">Statement file</Label>
-                <Input
-                  id="bank-statement-file"
-                  type="file"
-                  accept=".csv,.xls,.xlsx,.pdf"
-                  onChange={(event) => setStatementFile(event.target.files?.[0])}
-                />
-                <p className="text-xs text-muted-foreground">Supported: CSV, XLS, XLSX, or PDF · maximum 15 MB</p>
-              </div>
-              {statementFile && (
-                <div className="rounded-md border bg-muted/20 px-3 py-2 text-sm">
-                  Selected: <span className="font-medium">{statementFile.name}</span>
-                </div>
-              )}
-            </div>
-            <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setStatementUploadOpen(false)}>Cancel</Button>
-              <Button type="button" onClick={submitStatementUpload} disabled={!statementFile || !selectedBankId || uploadStatement.isPending}>
-                {uploadStatement.isPending ? 'Uploading…' : 'Upload Statement'}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-
-        <Dialog open={manualBankOpen} onOpenChange={setManualBankOpen}>
-          <DialogContent className="max-w-md">
-            <DialogHeader>
-              <DialogTitle>Add Bank Without API</DialogTitle>
-            </DialogHeader>
-            <div className="space-y-4">
-              <p className="text-sm text-muted-foreground">
-                Add an unsupported GCC or Pakistan institution for display. Because it has no API connection, live balances and transactions will remain unavailable until data is connected.
-              </p>
-              <div className="space-y-2">
-                <Label htmlFor="manual-bank-name">Bank name</Label>
-                <Input
-                  id="manual-bank-name"
-                  value={manualBank.institutionName}
-                  onChange={(event) => setManualBank((current) => ({ ...current, institutionName: event.target.value }))}
-                  placeholder="e.g. Meezan Bank, Emirates NBD"
-                />
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label>Country / currency</Label>
-                  <Select value={manualBank.country} onValueChange={(country) => setManualBank((current) => ({ ...current, country }))}>
-                    <SelectTrigger><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      {MANUAL_BANK_COUNTRIES.map((country) => (
-                        <SelectItem key={country.value} value={country.value}>{country.label} · {country.currency}</SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="space-y-2">
-                  <Label>Bank icon</Label>
-                  <Select value={manualBank.icon} onValueChange={(icon) => setManualBank((current) => ({ ...current, icon }))}>
-                    <SelectTrigger><SelectValue /></SelectTrigger>
-                    <SelectContent>
-                      {BANK_ICON_OPTIONS.map((icon) => <SelectItem key={icon} value={icon}>{icon} Bank mark</SelectItem>)}
-                    </SelectContent>
-                  </Select>
-                </div>
-              </div>
-            </div>
-            <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setManualBankOpen(false)}>Cancel</Button>
-              <Button type="button" onClick={addManualBank} disabled={!manualBank.institutionName.trim() || createManualBank.isPending}>
-                {createManualBank.isPending ? 'Adding…' : 'Add Bank'}
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
-
       </PageContent>
-    </>
+
+      {notice && <div role="status" className="fixed bottom-5 right-5 z-50 flex max-w-[calc(100vw-2rem)] items-center gap-2 rounded-md border border-[#9fc1b9] bg-[#214e54] px-3 py-2.5 text-xs text-[#eff8f3] shadow-lg"><Check className="size-3.5" />{notice}<button type="button" onClick={() => setNotice('')} className="ml-2 opacity-70 hover:opacity-100" aria-label="Dismiss notification"><X className="size-3.5" /></button></div>}
+
+      <Dialog open={statementUploadOpen} onOpenChange={(openState) => { setStatementUploadOpen(openState); if (!openState) setStatementFile(undefined); }}>
+        <DialogContent className="max-w-md border-[#cedbd6]">
+          <DialogHeader><DialogTitle>Upload bank statement</DialogTitle></DialogHeader>
+          <div className="space-y-4"><p className="text-sm text-muted-foreground">Store a source document for {selectedBank?.institutionName || 'the selected bank'}.</p><div className="space-y-2"><Label htmlFor="bank-statement-file">Statement file</Label><Input id="bank-statement-file" type="file" accept=".csv,.xls,.xlsx,.pdf" onChange={(event) => setStatementFile(event.target.files?.[0])} /><p className="text-xs text-muted-foreground">CSV, XLS, XLSX, or PDF · maximum 15 MB</p></div>{statementFile && <div className="rounded-md border bg-muted/20 px-3 py-2 text-sm">Selected: <span className="font-medium">{statementFile.name}</span></div>}</div>
+          <DialogFooter><Button type="button" variant="outline" onClick={() => setStatementUploadOpen(false)}>Cancel</Button><Button type="button" onClick={submitStatementUpload} disabled={!statementFile || !selectedBankId || uploadStatement.isPending}>{uploadStatement.isPending ? 'Uploading…' : 'Upload statement'}</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={manualBankOpen} onOpenChange={setManualBankOpen}>
+        <DialogContent className="max-w-md border-[#cedbd6]">
+          <DialogHeader><DialogTitle>Add bank without API</DialogTitle></DialogHeader>
+          <div className="space-y-4"><p className="text-sm text-muted-foreground">Create a manual profile for an institution not supported by Plaid. It will not invent balances or transactions.</p><div className="space-y-2"><Label htmlFor="manual-bank-name">Bank name</Label><Input id="manual-bank-name" value={manualBank.institutionName} onChange={(event) => setManualBank((current) => ({ ...current, institutionName: event.target.value }))} placeholder="e.g. Meezan Bank, Emirates NBD" /></div><div className="grid grid-cols-2 gap-4"><div className="space-y-2"><Label>Country / currency</Label><Select value={manualBank.country} onValueChange={(country) => setManualBank((current) => ({ ...current, country }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{MANUAL_BANK_COUNTRIES.map((country) => <SelectItem key={country.value} value={country.value}>{country.label} · {country.currency}</SelectItem>)}</SelectContent></Select></div><div className="space-y-2"><Label>Bank mark</Label><Select value={manualBank.icon} onValueChange={(icon) => setManualBank((current) => ({ ...current, icon }))}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{BANK_ICON_OPTIONS.map((icon) => <SelectItem key={icon} value={icon}>{icon} Mark</SelectItem>)}</SelectContent></Select></div></div></div>
+          <DialogFooter><Button type="button" variant="outline" onClick={() => setManualBankOpen(false)}>Cancel</Button><Button type="button" onClick={addManualBank} disabled={!manualBank.institutionName.trim() || createManualBank.isPending}>{createManualBank.isPending ? 'Adding…' : 'Add bank profile'}</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
   );
 }

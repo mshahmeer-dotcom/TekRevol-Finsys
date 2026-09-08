@@ -350,6 +350,25 @@ export function usePlaidUnpostedTransactions(itemId?: number) {
   });
 }
 
+export function useUpdatePlaidTransactionReview() {
+  return useMutation({
+    mutationFn: ({
+      itemId,
+      transactionIds,
+      reviewStatus,
+    }: {
+      itemId: number;
+      transactionIds: string[];
+      reviewStatus: 'pending' | 'posted' | 'excluded';
+    }) =>
+      apiFetch(`/plaid/items/${itemId}/transactions/review`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transactionIds, reviewStatus }),
+      }),
+  });
+}
+
 export function usePlaidStatements(itemId?: number) {
   return useQuery({
     queryKey: ['plaid-statements', itemId],

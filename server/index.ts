@@ -1,201 +1,4 @@
-import express from "express";
-import cors from "cors";
-import Database from "better-sqlite3";
-import fs from "fs";
-import multer from "multer";
-import path from "path";
-import crypto from "crypto";
-import { fileURLToPath } from "url";
-import {
-  Configuration,
-  CountryCode,
-  PlaidApi,
-  PlaidEnvironments,
-  Products,
-} from "plaid";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const db = new Database(path.join(__dirname, "finance.db"));
-db.pragma("journal_mode = WAL");
-db.pragma("foreign_keys = ON");
-
-const BANK_STATEMENT_UPLOAD_DIR = path.join(__dirname, "uploads", "bank-statements");
-fs.mkdirSync(BANK_STATEMENT_UPLOAD_DIR, { recursive: true });
-const bankStatementUpload = multer({
-  storage: multer.diskStorage({
-    destination: BANK_STATEMENT_UPLOAD_DIR,
-    filename: (_req, file, callback) => {
-      callback(null, `${crypto.randomUUID()}${path.extname(file.originalname).toLowerCase()}`);
-    },
-  }),
-  limits: { fileSize: 15 * 1024 * 1024 },
-  fileFilter: (_req, file, callback) => {
-    const extension = path.extname(file.originalname).toLowerCase();
-    if (![".csv", ".xls", ".xlsx", ".pdf"].includes(extension)) {
-      callback(new Error("Only CSV, XLS, XLSX, and PDF bank statements are supported"));
-      return;
-    }
-    callback(null, true);
-  },
-});
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    code TEXT NOT NULL DEFAULT '',
-    category TEXT NOT NULL DEFAULT '',
-    name TEXT NOT NULL,
-    type TEXT NOT NULL,
-    description TEXT DEFAULT ''
-  );
-
-  CREATE TABLE IF NOT EXISTS revenue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT NOT NULL,
-    brand TEXT NOT NULL,
-    projectName TEXT DEFAULT '',
-    client TEXT NOT NULL,
-    revenueType TEXT NOT NULL DEFAULT 'Fresh',
-    originalCurrency TEXT NOT NULL DEFAULT 'USD',
-    originalAmount REAL NOT NULL DEFAULT 0,
-    exchangeRate REAL NOT NULL DEFAULT 1,
-    usdAmount REAL NOT NULL DEFAULT 0,
-    notes TEXT DEFAULT ''
-  );
-
-  CREATE TABLE IF NOT EXISTS expenses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT NOT NULL,
-    vendor TEXT NOT NULL,
-    expenseCategory TEXT DEFAULT '',
-    expenseHead TEXT NOT NULL,
-    department TEXT DEFAULT '',
-    description TEXT DEFAULT '',
-    originalCurrency TEXT NOT NULL DEFAULT 'USD',
-    originalAmount REAL NOT NULL DEFAULT 0,
-    exchangeRate REAL NOT NULL DEFAULT 1,
-    usdAmount REAL NOT NULL DEFAULT 0,
-    paidByEntity TEXT NOT NULL DEFAULT 'PK',
-    paidFromBank TEXT NOT NULL DEFAULT 'PK Bank',
-    costOwner TEXT NOT NULL DEFAULT 'Shared',
-    allocationMethod TEXT NOT NULL DEFAULT 'Percentage',
-    caPct REAL DEFAULT 0,
-    txPct REAL DEFAULT 0,
-    uaePct REAL DEFAULT 0,
-    pkPct REAL DEFAULT 0,
-    buzzPct REAL DEFAULT 0,
-    notes TEXT DEFAULT ''
-  );
-
-  CREATE TABLE IF NOT EXISTS exchange_rates (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    currency TEXT NOT NULL,
-    rateToUsd REAL NOT NULL DEFAULT 1,
-    effectiveMonth TEXT NOT NULL,
-    notes TEXT DEFAULT '',
-    UNIQUE(currency, effectiveMonth)
-  );
-
-  CREATE TABLE IF NOT EXISTS allocation_rules (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    description TEXT DEFAULT '',
-    caPct REAL DEFAULT 0,
-    txPct REAL DEFAULT 0,
-    uaePct REAL DEFAULT 0,
-    pkPct REAL DEFAULT 0,
-    buzzPct REAL DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS departments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE COLLATE NOCASE
-  );
-
-  CREATE TABLE IF NOT EXISTS expense_monthly_allocations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    expenseId INTEGER NOT NULL REFERENCES expenses(id) ON DELETE CASCADE,
-    month TEXT NOT NULL,
-    amount REAL NOT NULL DEFAULT 0,
-    caPct REAL DEFAULT 0,
-    txPct REAL DEFAULT 0,
-    uaePct REAL DEFAULT 0,
-    pkPct REAL DEFAULT 0,
-    buzzPct REAL DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS revenue_monthly_allocations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    revenueId INTEGER NOT NULL REFERENCES revenue(id) ON DELETE CASCADE,
-    month TEXT NOT NULL,
-    amount REAL NOT NULL DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS intercompany_transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    fromEntity TEXT NOT NULL,
-    toEntity TEXT NOT NULL,
-    originalCurrency TEXT NOT NULL DEFAULT 'USD',
-    originalAmount REAL NOT NULL DEFAULT 0,
-    exchangeRate REAL NOT NULL DEFAULT 1,
-    usdAmount REAL NOT NULL DEFAULT 0,
-    date TEXT NOT NULL,
-    description TEXT DEFAULT ''
-  );
-
-  CREATE TABLE IF NOT EXISTS plaid_items (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    itemId TEXT NOT NULL UNIQUE,
-    institutionId TEXT DEFAULT '',
-    institutionName TEXT NOT NULL,
-    accessToken TEXT NOT NULL,
-    cursor TEXT DEFAULT '',
-    provider TEXT NOT NULL DEFAULT 'plaid',
-    country TEXT DEFAULT '',
-    icon TEXT DEFAULT '',
-    isManual INTEGER NOT NULL DEFAULT 0,
-    createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS plaid_accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    itemId INTEGER NOT NULL REFERENCES plaid_items(id) ON DELETE CASCADE,
-    plaidAccountId TEXT NOT NULL UNIQUE,
-    name TEXT NOT NULL,
-    officialName TEXT DEFAULT '',
-    mask TEXT DEFAULT '',
-    type TEXT DEFAULT '',
-    subtype TEXT DEFAULT '',
-    isoCurrency TEXT DEFAULT 'USD',
-    currentBalance REAL DEFAULT NULL,
-    availableBalance REAL DEFAULT NULL,
-    createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS plaid_transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    itemId INTEGER NOT NULL REFERENCES plaid_items(id) ON DELETE CASCADE,
-    plaidTransactionId TEXT NOT NULL UNIQUE,
-    plaidAccountId TEXT NOT NULL,
-    date TEXT NOT NULL,
-    authorizedDate TEXT DEFAULT '',
-    name TEXT NOT NULL,
-    merchantName TEXT DEFAULT '',
-    amount REAL NOT NULL DEFAULT 0,
-    isoCurrency TEXT DEFAULT 'USD',
-    pending INTEGER NOT NULL DEFAULT 0,
-    category TEXT DEFAULT '',
-    rawJson TEXT NOT NULL DEFAULT '{}',
-    isSample INTEGER NOT NULL DEFAULT 0,
-    createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS bank_statements (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    itemId INTEGER NOT NULL REFERENCES plaid_items(id) ON DELETE CASCADE,
-    originalName TEXT NOT NULL,
-    storedName TEXT NOT NULL UNIQUE,
+ NOT NULL UNIQUE,
     mimeType TEXT DEFAULT '',
     fileSize INTEGER NOT NULL DEFAULT 0,
     createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -224,6 +27,7 @@ ensureColumn("plaid_items", "country", "country TEXT DEFAULT ''");
 ensureColumn("plaid_items", "icon", "icon TEXT DEFAULT ''");
 ensureColumn("plaid_items", "isManual", "isManual INTEGER NOT NULL DEFAULT 0");
 ensureColumn("plaid_transactions", "isSample", "isSample INTEGER NOT NULL DEFAULT 0");
+ensureColumn("plaid_transactions", "reviewStatus", "reviewStatus TEXT NOT NULL DEFAULT 'pending'");
 ensureColumn("plaid_accounts", "currentBalance", "currentBalance REAL DEFAULT NULL");
 ensureColumn("plaid_accounts", "availableBalance", "availableBalance REAL DEFAULT NULL");
 
@@ -1464,7 +1268,11 @@ app.get("/api/plaid/items", (_req, res) => {
         COALESCE(SUM(a.availableBalance), 0) as availableBalance,
         MAX(a.isoCurrency) as balanceCurrency,
         (SELECT COUNT(*) FROM plaid_transactions pending_t
-         WHERE pending_t.itemId = i.id AND pending_t.pending = 1) as unpostedCount
+         WHERE pending_t.itemId = i.id AND pending_t.reviewStatus = 'pending') as pendingCount,
+        (SELECT COUNT(*) FROM plaid_transactions posted_t
+         WHERE posted_t.itemId = i.id AND posted_t.reviewStatus = 'posted') as postedCount,
+        (SELECT COUNT(*) FROM plaid_transactions excluded_t
+         WHERE excluded_t.itemId = i.id AND excluded_t.reviewStatus = 'excluded') as excludedCount
        FROM plaid_items i
        LEFT JOIN plaid_accounts a ON a.itemId = i.id
        GROUP BY i.id
@@ -1496,15 +1304,51 @@ app.get("/api/plaid/transactions", (req, res) => {
 
 app.get("/api/plaid/items/:id/unposted", (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
-  res.json(db.prepare(
+  const itemId = Number(req.params.id);
+  const transactions = db.prepare(
     `SELECT t.*, i.institutionName, i.icon, i.provider, a.name as accountName
      FROM plaid_transactions t
      JOIN plaid_items i ON i.id = t.itemId
      LEFT JOIN plaid_accounts a ON a.plaidAccountId = t.plaidAccountId
-     WHERE t.itemId = ? AND t.pending = 1
+     WHERE t.itemId = ?
      ORDER BY t.date DESC, t.id DESC
      LIMIT ?`,
-  ).all(Number(req.params.id), limit));
+  ).all(itemId, limit);
+  const counts = db.prepare(
+    `SELECT reviewStatus as status, COUNT(*) as count
+     FROM plaid_transactions
+     WHERE itemId = ?
+     GROUP BY reviewStatus`,
+  ).all(itemId) as { status: string; count: number }[];
+  const reviewCounts = { pending: 0, posted: 0, excluded: 0 };
+  counts.forEach(({ status, count }) => {
+    if (status in reviewCounts) reviewCounts[status as keyof typeof reviewCounts] = Number(count);
+  });
+  res.json({ transactions, counts: reviewCounts });
+});
+
+app.patch("/api/plaid/items/:id/transactions/review", (req, res) => {
+  const itemId = Number(req.params.id);
+  const transactionIds = Array.isArray(req.body?.transactionIds)
+    ? [...new Set(req.body.transactionIds.map((id: unknown) => String(id).trim()).filter(Boolean))]
+    : [];
+  const reviewStatus = String(req.body?.reviewStatus || "");
+  if (!Number.isInteger(itemId) || transactionIds.length === 0) {
+    return res.status(400).json({ message: "At least one transaction is required" });
+  }
+  if (!["pending", "posted", "excluded"].includes(reviewStatus)) {
+    return res.status(400).json({ message: "Review status must be pending, posted, or excluded" });
+  }
+  const item = db.prepare("SELECT id FROM plaid_items WHERE id = ?").get(itemId);
+  if (!item) return res.status(404).json({ message: "Plaid item not found" });
+
+  const placeholders = transactionIds.map(() => "?").join(", ");
+  const result = db.prepare(
+    `UPDATE plaid_transactions
+     SET reviewStatus = ?
+     WHERE itemId = ? AND plaidTransactionId IN (${placeholders})`,
+  ).run(reviewStatus, itemId, ...transactionIds);
+  res.json({ updated: result.changes, reviewStatus });
 });
 
 app.get("/api/plaid/items/:id/statements", (req, res) => {
